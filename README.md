@@ -425,11 +425,16 @@ For most long-lived LCM setups, a good starting point is:
 }
 ```
 
+### NanoClaw v2 bridge
+
+In addition to the OpenClaw plugin entry point, the package exports a NanoClaw v2 bridge for forks using NanoClaw's `data/v2.db` plus per-session `inbound.db`/`outbound.db` interface. The bridge provides read-only session/message projection helpers and adapts `lcm_grep` / `lcm_describe` into NanoClaw-style MCP tool definitions. See [NanoClaw v2 integration](docs/nanoclaw-v2.md).
+
 ## Documentation
 
 - [Configuration guide](docs/configuration.md)
 - [Architecture](docs/architecture.md)
 - [Agent tools](docs/agent-tools.md)
+- [NanoClaw v2 integration](docs/nanoclaw-v2.md)
 - [TUI Reference](docs/tui.md)
 - [lcm-tui](tui/README.md)
 - [Optional: enable FTS5 for fast full-text search](docs/fts5.md)
