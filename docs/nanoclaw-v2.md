@@ -30,6 +30,8 @@ import {
   writeNanoclawV2SessionTranscriptFile,
   bootstrapNanoclawV2Session,
   bootstrapNanoclawV2Sessions,
+  createLcmRuntime,
+  createLcmRuntimeRecallTools,
   createNanoclawV2RecallTools,
   createNanoclawV2RecallInstructions,
 } from "@martian-engineering/lossless-claw";
@@ -44,25 +46,42 @@ Useful primitives:
 - `writeNanoclawV2SessionTranscriptFile(...)` writes a JSONL transcript mirror in the same `{ message }` shape that the LCM engine already bootstraps from.
 - `bootstrapNanoclawV2Session(...)` writes that transcript mirror and calls `lcm.bootstrap({ sessionId, sessionKey, sessionFile })`.
 - `bootstrapNanoclawV2Sessions(...)` repeats that flow for the central `sessions` table or for a caller-provided session list.
+- `createLcmRuntime(...)` creates a host-owned LCM database connection and engine using explicit host adapters.
+- `createLcmRuntimeRecallTools(...)` returns package-native `lcm_grep` and `lcm_describe` tool objects for hosts that do not need NanoClaw MCP wrapping.
 - `createNanoclawV2RecallTools(...)` adapts `lcm_grep` and `lcm_describe` into NanoClaw v2 MCP `{ tool, handler }` definitions.
 
 ## Suggested host wiring
 
-A NanoClaw fork can ingest all known sessions by resolving paths and passing its LCM engine instance to the bridge:
+A NanoClaw fork can create a host-owned LCM runtime, ingest all known sessions, and then expose recall tools to containers:
 
 ```ts
 const paths = resolveNanoclawV2Paths({ projectRoot: process.cwd() });
+const runtime = createLcmRuntime({
+  databasePath: `${paths.dataDir}/lossless-claw/lcm.db`,
+  largeFilesDir: `${paths.dataDir}/lossless-claw/files`,
+  env: process.env,
+  // Required before enabling write/compaction features:
+  complete: hostLlmComplete,
+  callGateway: hostGatewayCall,
+  resolveSessionIdFromSessionKey: hostResolveSessionId,
+  resolveSessionTranscriptFile: hostResolveTranscriptPath,
+});
 
 const results = await bootstrapNanoclawV2Sessions({
-  lcm,
+  lcm: runtime.lcm,
   paths,
   // Optional: omit system rows if your NanoClaw host does not want them in recall.
   includeSystem: false,
 });
 
-console.log(
-  `Bootstrapped ${results.length} NanoClaw sessions into lossless-claw`
-);
+console.log(`Bootstrapped ${results.length} NanoClaw sessions into lossless-claw`);
+
+const recallTools = createNanoclawV2RecallTools({
+  deps: runtime.deps,
+  lcm: runtime.lcm,
+  sessionId: activeSession.id,
+  sessionKey: buildNanoclawV2SessionKey(activeSession),
+});
 ```
 
 For a single active session, use the narrower helper:
@@ -82,6 +101,18 @@ console.log(result.sessionKey, result.sessionFile, result.bootstrap);
 
 For agent recall, install the returned MCP definitions into NanoClaw's v2 tool registry and include `createNanoclawV2RecallInstructions()` in the composed agent instructions. Keep the LCM database host-owned; if a container needs direct access, mount it read-only and continue to route writes through the host.
 
+## Runtime API safety contract
+
+`createLcmRuntime` is intentionally explicit about host-owned capabilities:
+
+- `databasePath` and `largeFilesDir` keep LCM state outside NanoClaw's live message DBs.
+- `complete` is required for summarization/compaction. If omitted, the runtime fails closed for model-backed summarization rather than using hidden credentials.
+- `callGateway` is required for delegated expansion/subagents. If omitted, delegated calls fail closed.
+- `resolveSessionIdFromSessionKey` and `resolveSessionTranscriptFile` are host adapters; they should be implemented by NanoClaw against its typed session model.
+- `runtime.close()` closes the factory-owned SQLite connection.
+
+This API is enough for NanoClaw to wire live `lcm_grep` and `lcm_describe` safely after the host decides where MCP tools are registered and how active session identity is passed into containers.
+
 ## Current scope
 
 This is a v2 bridge, not a full NanoClaw product module. It covers:
@@ -89,6 +120,7 @@ This is a v2 bridge, not a full NanoClaw product module. It covers:
 - v2 path/session identity helpers
 - read-only transcript projection from `inbound.db`/`outbound.db`
 - lossless-claw-owned transcript mirror writing for LCM bootstrap
+- public host runtime factory for LCM engine/config instantiation
 - one-session and all-session bootstrap helpers
 - MCP-definition adaptation for recall tools
 - tests for session keys, DB reads, row mapping, transcript writing, bootstrap wrapping, legacy DB tolerance, and tool wrapping
