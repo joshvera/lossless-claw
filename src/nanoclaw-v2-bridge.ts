@@ -1,5 +1,23 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentMessage, BootstrapResult } from "./openclaw-bridge.js";
 import type { LcmContextEngine } from "./engine.js";
@@ -71,6 +89,12 @@ export type NanoclawV2TranscriptWriteResult = {
   messageCount: number;
 };
 
+export type NanoclawV2ReadFailure = {
+  source: "sessions" | "inbound" | "outbound";
+  dbPath: string;
+  error: unknown;
+};
+
 export type NanoclawV2BootstrapResult = NanoclawV2TranscriptWriteResult & {
   session: NanoclawV2Session;
   bootstrap: BootstrapResult;
@@ -94,6 +118,10 @@ export type NanoclawV2McpToolDefinition = {
   tool: NanoclawV2McpTool;
   handler: (args: Record<string, unknown>) => Promise<unknown>;
 };
+
+export type NanoclawV2ReadErrorHandler = (
+  failure: NanoclawV2ReadFailure
+) => void;
 
 export type NanoclawV2ToolAdapterContext = {
   sessionId?: string;
@@ -153,7 +181,14 @@ export function nanoclawV2SessionDir(
   paths: NanoclawV2Paths,
   session: Pick<NanoclawV2Session, "agent_group_id" | "id">
 ): string {
-  return join(paths.sessionsDir, session.agent_group_id, session.id);
+  const sessionsRoot = resolve(paths.sessionsDir);
+  const sessionDir = resolve(sessionsRoot, session.agent_group_id, session.id);
+  if (!isPathInsideDirectory(sessionDir, sessionsRoot)) {
+    throw new Error(
+      `NanoClaw v2 session path escapes sessionsDir: ${session.agent_group_id}/${session.id}`
+    );
+  }
+  return sessionDir;
 }
 
 export function nanoclawV2InboundDbPath(
@@ -232,20 +267,20 @@ export function writeNanoclawV2SessionTranscriptFile(input: {
     nanoclawV2TranscriptFilePath(input.paths, input.session, {
       lcmStateDir: input.lcmStateDir,
     });
+  const readFailures: NanoclawV2ReadFailure[] = [];
   const transcript = readNanoclawV2SessionMessages({
     inboundDbPath: nanoclawV2InboundDbPath(input.paths, input.session),
     outboundDbPath: nanoclawV2OutboundDbPath(input.paths, input.session),
     includeSystem: input.includeSystem,
+    onReadError: (failure) => readFailures.push(failure),
   });
+  if (readFailures.length > 0) {
+    throw new Error(
+      `Refusing to overwrite NanoClaw v2 transcript mirror after ${readFailures.length} transient SQLite read failure(s); existing mirror left unchanged`
+    );
+  }
   mkdirSync(dirname(sessionFile), { recursive: true });
-  const transcriptJsonl = transcript
-    .map((entry) => JSON.stringify({ message: entry.message }))
-    .join("\n");
-  writeFileSync(
-    sessionFile,
-    transcriptJsonl + (transcriptJsonl ? "\n" : ""),
-    "utf8"
-  );
+  writeTranscriptJsonlAtomically(sessionFile, transcript);
   return { sessionFile, sessionKey, messageCount: transcript.length };
 }
 
@@ -293,13 +328,15 @@ export async function bootstrapNanoclawV2Sessions(input: {
 }
 
 export function readNanoclawV2Sessions(
-  centralDbPath: string
+  centralDbPath: string,
+  input: { onReadError?: NanoclawV2ReadErrorHandler } = {}
 ): NanoclawV2Session[] {
   if (!existsSync(centralDbPath)) {
     return [];
   }
-  const db = openReadOnlyDatabase(centralDbPath);
+  let db: DatabaseSync | undefined;
   try {
+    db = openReadOnlyDatabase(centralDbPath);
     if (!hasTable(db, "sessions")) {
       return [];
     }
@@ -310,8 +347,15 @@ export function readNanoclawV2Sessions(
         ORDER BY COALESCE(last_active, created_at, '') DESC, id ASC`
       )
       .all() as NanoclawV2Session[];
+  } catch (error) {
+    return handleSqliteReadError({
+      source: "sessions",
+      dbPath: centralDbPath,
+      error,
+      onReadError: input.onReadError,
+    });
   } finally {
-    db.close();
+    db?.close();
   }
 }
 
@@ -319,15 +363,16 @@ export function readNanoclawV2SessionMessages(input: {
   inboundDbPath: string;
   outboundDbPath: string;
   includeSystem?: boolean;
+  onReadError?: NanoclawV2ReadErrorHandler;
 }): NanoclawV2TranscriptMessage[] {
-  const inbound = readInboundRows(input.inboundDbPath)
+  const inbound = readInboundRows(input.inboundDbPath, input.onReadError)
     .filter((row) => input.includeSystem !== false || row.kind !== "system")
     .map<NanoclawV2TranscriptMessage>((row) => ({
       source: "inbound",
       row,
       message: mapNanoclawV2InboundToAgentMessage(row),
     }));
-  const outbound = readOutboundRows(input.outboundDbPath)
+  const outbound = readOutboundRows(input.outboundDbPath, input.onReadError)
     .filter((row) => input.includeSystem !== false || row.kind !== "system")
     .map<NanoclawV2TranscriptMessage>((row) => ({
       source: "outbound",
@@ -436,7 +481,7 @@ export function adaptLcmToolForNanoclawV2(
     async handler(args) {
       const toolCallId = `${context.toolCallIdPrefix ?? "nanoclaw-v2"}-${
         tool.name
-      }-${Date.now()}`;
+      }-${randomUUID()}`;
       const execute = tool.execute as unknown as (
         toolCallId: string,
         params: Record<string, unknown>,
@@ -477,12 +522,16 @@ export function createNanoclawV2RecallInstructions(): string {
   ].join("\n");
 }
 
-function readInboundRows(dbPath: string): NanoclawV2MessageInRow[] {
+function readInboundRows(
+  dbPath: string,
+  onReadError?: NanoclawV2ReadErrorHandler
+): NanoclawV2MessageInRow[] {
   if (!existsSync(dbPath)) {
     return [];
   }
-  const db = openReadOnlyDatabase(dbPath);
+  let db: DatabaseSync | undefined;
   try {
+    db = openReadOnlyDatabase(dbPath);
     if (!hasTable(db, "messages_in")) {
       return [];
     }
@@ -514,17 +563,28 @@ function readInboundRows(dbPath: string): NanoclawV2MessageInRow[] {
         ORDER BY timestamp ASC, ${seqOrder} ASC, id ASC`
       )
       .all() as NanoclawV2MessageInRow[];
+  } catch (error) {
+    return handleSqliteReadError({
+      source: "inbound",
+      dbPath,
+      error,
+      onReadError,
+    });
   } finally {
-    db.close();
+    db?.close();
   }
 }
 
-function readOutboundRows(dbPath: string): NanoclawV2MessageOutRow[] {
+function readOutboundRows(
+  dbPath: string,
+  onReadError?: NanoclawV2ReadErrorHandler
+): NanoclawV2MessageOutRow[] {
   if (!existsSync(dbPath)) {
     return [];
   }
-  const db = openReadOnlyDatabase(dbPath);
+  let db: DatabaseSync | undefined;
   try {
+    db = openReadOnlyDatabase(dbPath);
     if (!hasTable(db, "messages_out")) {
       return [];
     }
@@ -552,13 +612,120 @@ function readOutboundRows(dbPath: string): NanoclawV2MessageOutRow[] {
         ORDER BY timestamp ASC, ${seqOrder} ASC, id ASC`
       )
       .all() as NanoclawV2MessageOutRow[];
+  } catch (error) {
+    return handleSqliteReadError({
+      source: "outbound",
+      dbPath,
+      error,
+      onReadError,
+    });
   } finally {
-    db.close();
+    db?.close();
   }
 }
 
 function openReadOnlyDatabase(dbPath: string): DatabaseSync {
-  return new DatabaseSync(dbPath, { readOnly: true });
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  db.exec("PRAGMA busy_timeout = 2000");
+  return db;
+}
+
+function writeTranscriptJsonlAtomically(
+  sessionFile: string,
+  transcript: NanoclawV2TranscriptMessage[]
+): void {
+  const sessionDir = dirname(sessionFile);
+  const tempFile = join(
+    sessionDir,
+    `.${basename(sessionFile)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  let fd: number | undefined;
+  try {
+    fd = openSync(tempFile, "wx", 0o600);
+    for (const entry of transcript) {
+      writeSync(fd, `${JSON.stringify({ message: entry.message })}\n`);
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tempFile, sessionFile);
+    fsyncDirectoryBestEffort(sessionDir);
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    try {
+      unlinkSync(tempFile);
+    } catch {
+      // Temp cleanup is best-effort; never delete the existing mirror.
+    }
+    throw error;
+  }
+}
+
+function fsyncDirectoryBestEffort(directory: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(directory, "r");
+    fsyncSync(fd);
+  } catch {
+    // Some platforms do not allow fsync on directories. The file itself was fsynced.
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
+  }
+}
+
+function handleSqliteReadError<T>(input: {
+  source: NanoclawV2ReadFailure["source"];
+  dbPath: string;
+  error: unknown;
+  onReadError?: NanoclawV2ReadErrorHandler;
+}): T[] {
+  if (!isRecoverableSqliteReadError(input.error) || !input.onReadError) {
+    throw input.error;
+  }
+  input.onReadError({
+    source: input.source,
+    dbPath: input.dbPath,
+    error: input.error,
+  });
+  return [];
+}
+
+function isRecoverableSqliteReadError(error: unknown): boolean {
+  const record = error as { code?: unknown; message?: unknown };
+  const code = typeof record.code === "string" ? record.code : "";
+  if (
+    code === "SQLITE_BUSY" ||
+    code === "SQLITE_LOCKED" ||
+    code === "SQLITE_CORRUPT" ||
+    code === "SQLITE_NOTADB"
+  ) {
+    return true;
+  }
+  const message = typeof record.message === "string" ? record.message : "";
+  return /SQLITE_(BUSY|LOCKED|CORRUPT|NOTADB)|database is locked|database disk image is malformed|file is not a database/i.test(
+    message
+  );
+}
+
+function isPathInsideDirectory(
+  candidatePath: string,
+  rootPath: string
+): boolean {
+  const relativePath = relative(rootPath, candidatePath);
+  return (
+    relativePath.length > 0 &&
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${sep}`) &&
+    !isAbsolute(relativePath)
+  );
 }
 
 function hasTable(db: DatabaseSync, tableName: string): boolean {
