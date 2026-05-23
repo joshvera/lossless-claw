@@ -427,7 +427,7 @@ For most long-lived LCM setups, a good starting point is:
 
 ### NanoClaw v2 bridge
 
-In addition to the OpenClaw plugin entry point, the package exports a NanoClaw v2 bridge for forks using NanoClaw's `data/v2.db` plus per-session `inbound.db`/`outbound.db` interface. The bridge provides read-only session/message projection helpers and adapts `lcm_grep` / `lcm_describe` into NanoClaw-style MCP tool definitions. See [NanoClaw v2 integration](docs/nanoclaw-v2.md).
+In addition to the OpenClaw plugin entry point, the package exports a NanoClaw v2 bridge for forks using NanoClaw's `data/v2.db` plus per-session `inbound.db`/`outbound.db` interface. The bridge provides read-only session/message projection helpers, writes lossless-claw-owned transcript mirrors for `lcm.bootstrap({ sessionFile })`, bootstraps one or all NanoClaw sessions into LCM, and adapts `lcm_grep` / `lcm_describe` into NanoClaw-style MCP tool definitions. See [NanoClaw v2 integration](docs/nanoclaw-v2.md).
 
 ## Documentation
 

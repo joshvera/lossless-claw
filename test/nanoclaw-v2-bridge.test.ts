@@ -1,18 +1,22 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
   adaptLcmToolForNanoclawV2,
+  bootstrapNanoclawV2Session,
+  bootstrapNanoclawV2Sessions,
   buildNanoclawV2SessionKey,
   isNanoclawV2SessionKey,
   mapNanoclawV2InboundToAgentMessage,
   mapNanoclawV2OutboundToAgentMessage,
   nanoclawV2InboundDbPath,
   nanoclawV2OutboundDbPath,
+  nanoclawV2TranscriptFilePath,
   parseNanoclawV2SessionKey,
   readNanoclawV2SessionMessages,
+  writeNanoclawV2SessionTranscriptFile,
   resolveNanoclawV2Paths,
 } from "../src/nanoclaw-v2-bridge.js";
 import type { AnyAgentTool } from "../src/tools/common.js";
@@ -29,8 +33,12 @@ describe("nanoclaw v2 bridge", () => {
     expect(key).toBe("nanoclaw:v2:ag%20main:sess%2F1");
     expect(isNanoclawV2SessionKey(key)).toBe(true);
     expect(parseNanoclawV2SessionKey(key)).toEqual(session);
-    expect(nanoclawV2InboundDbPath(paths, session)).toBe("/repo/nanoclaw/data/v2-sessions/ag main/sess/1/inbound.db");
-    expect(nanoclawV2OutboundDbPath(paths, session)).toBe("/repo/nanoclaw/data/v2-sessions/ag main/sess/1/outbound.db");
+    expect(nanoclawV2InboundDbPath(paths, session)).toBe(
+      "/repo/nanoclaw/data/v2-sessions/ag main/sess/1/inbound.db"
+    );
+    expect(nanoclawV2OutboundDbPath(paths, session)).toBe(
+      "/repo/nanoclaw/data/v2-sessions/ag main/sess/1/outbound.db"
+    );
   });
 
   it("maps inbound and outbound rows into LCM agent messages without dropping raw metadata", () => {
@@ -103,8 +111,17 @@ describe("nanoclaw v2 bridge", () => {
           on_wake INTEGER
         );
       `);
-      inbound.prepare("INSERT INTO messages_in (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)")
-        .run("in-1", 2, "chat", "2026-05-23T01:00:00.000Z", JSON.stringify({ text: "first" }));
+      inbound
+        .prepare(
+          "INSERT INTO messages_in (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)"
+        )
+        .run(
+          "in-1",
+          2,
+          "chat",
+          "2026-05-23T01:00:00.000Z",
+          JSON.stringify({ text: "first" })
+        );
       inbound.close();
 
       const outbound = new DatabaseSync(outboundPath);
@@ -123,15 +140,223 @@ describe("nanoclaw v2 bridge", () => {
           content TEXT NOT NULL
         );
       `);
-      outbound.prepare("INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)")
-        .run("out-1", 4, "chat", "2026-05-23T01:00:01.000Z", JSON.stringify({ text: "second" }));
+      outbound
+        .prepare(
+          "INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)"
+        )
+        .run(
+          "out-1",
+          4,
+          "chat",
+          "2026-05-23T01:00:01.000Z",
+          JSON.stringify({ text: "second" })
+        );
       outbound.close();
 
-      const messages = readNanoclawV2SessionMessages({ inboundDbPath: inboundPath, outboundDbPath: outboundPath });
-      expect(messages.map((m) => [m.source, m.message.role, m.message.content])).toEqual([
+      const messages = readNanoclawV2SessionMessages({
+        inboundDbPath: inboundPath,
+        outboundDbPath: outboundPath,
+      });
+      expect(
+        messages.map((m) => [m.source, m.message.role, m.message.content])
+      ).toEqual([
         ["inbound", "user", "first"],
         ["outbound", "assistant", "second"],
       ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes NanoClaw sessions to LCM-compatible transcript files and bootstraps them", async () => {
+    const root = join(
+      tmpdir(),
+      `lcm-nanoclaw-v2-bootstrap-${process.pid}-${Date.now()}`
+    );
+    mkdirSync(root, { recursive: true });
+    try {
+      const paths = resolveNanoclawV2Paths({ projectRoot: root });
+      const lcmStateDir = join(root, "lcm-state");
+      const session = { agent_group_id: "ag/main", id: "sess/1" };
+      mkdirSync(join(paths.sessionsDir, session.agent_group_id, session.id), {
+        recursive: true,
+      });
+
+      const inboundPath = nanoclawV2InboundDbPath(paths, session);
+      const outboundPath = nanoclawV2OutboundDbPath(paths, session);
+      const inbound = new DatabaseSync(inboundPath);
+      inbound.exec(`
+        CREATE TABLE messages_in (
+          id TEXT PRIMARY KEY,
+          seq INTEGER,
+          kind TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          content TEXT NOT NULL
+        );
+      `);
+      inbound
+        .prepare(
+          "INSERT INTO messages_in (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)"
+        )
+        .run(
+          "in-1",
+          2,
+          "chat",
+          "2026-05-23T01:00:00.000Z",
+          JSON.stringify({ text: "first" })
+        );
+      inbound.close();
+
+      const outbound = new DatabaseSync(outboundPath);
+      outbound.exec(`
+        CREATE TABLE messages_out (
+          id TEXT PRIMARY KEY,
+          timestamp TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL
+        );
+      `);
+      outbound
+        .prepare(
+          "INSERT INTO messages_out (id, timestamp, kind, content) VALUES (?, ?, ?, ?)"
+        )
+        .run(
+          "out-1",
+          "2026-05-23T01:00:01.000Z",
+          "chat",
+          JSON.stringify({ text: "second" })
+        );
+      outbound.close();
+
+      const defaultPath = nanoclawV2TranscriptFilePath(paths, session, {
+        lcmStateDir,
+      });
+      expect(defaultPath).toContain("nanoclaw-v2-transcripts");
+      expect(defaultPath).not.toContain("ag/main/sess/1");
+
+      const written = writeNanoclawV2SessionTranscriptFile({
+        paths,
+        session,
+        lcmStateDir,
+      });
+      expect(written).toMatchObject({
+        sessionFile: defaultPath,
+        sessionKey: "nanoclaw:v2:ag%2Fmain:sess%2F1",
+        messageCount: 2,
+      });
+      const lines = readFileSync(written.sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(
+        lines.map((line) => [line.message.role, line.message.content])
+      ).toEqual([
+        ["user", "first"],
+        ["assistant", "second"],
+      ]);
+
+      const calls: unknown[] = [];
+      const lcm = {
+        async bootstrap(params: {
+          sessionId: string;
+          sessionKey?: string;
+          sessionFile: string;
+        }) {
+          calls.push(params);
+          return { bootstrapped: true, importedMessages: 2 };
+        },
+      };
+
+      const bootstrapped = await bootstrapNanoclawV2Session({
+        lcm,
+        paths,
+        session,
+        lcmStateDir,
+      });
+      expect(bootstrapped.bootstrap).toEqual({
+        bootstrapped: true,
+        importedMessages: 2,
+      });
+      expect(calls).toEqual([
+        {
+          sessionId: "sess/1",
+          sessionKey: "nanoclaw:v2:ag%2Fmain:sess%2F1",
+          sessionFile: defaultPath,
+        },
+      ]);
+
+      const all = await bootstrapNanoclawV2Sessions({
+        lcm,
+        paths,
+        sessions: [session],
+        lcmStateDir,
+      });
+      expect(all).toHaveLength(1);
+      expect(calls).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("tolerates legacy NanoClaw session DBs without later optional columns", () => {
+    const root = join(
+      tmpdir(),
+      `lcm-nanoclaw-v2-legacy-${process.pid}-${Date.now()}`
+    );
+    mkdirSync(root, { recursive: true });
+    try {
+      const inboundPath = join(root, "inbound.db");
+      const outboundPath = join(root, "outbound.db");
+      const inbound = new DatabaseSync(inboundPath);
+      inbound.exec(`
+        CREATE TABLE messages_in (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          content TEXT NOT NULL
+        );
+      `);
+      inbound
+        .prepare(
+          "INSERT INTO messages_in (id, kind, timestamp, content) VALUES (?, ?, ?, ?)"
+        )
+        .run("legacy-in", "chat", "2026-05-23T01:00:00.000Z", "legacy hello");
+      inbound.close();
+
+      const outbound = new DatabaseSync(outboundPath);
+      outbound.exec(`
+        CREATE TABLE messages_out (
+          id TEXT PRIMARY KEY,
+          timestamp TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL
+        );
+      `);
+      outbound
+        .prepare(
+          "INSERT INTO messages_out (id, timestamp, kind, content) VALUES (?, ?, ?, ?)"
+        )
+        .run(
+          "legacy-out",
+          "2026-05-23T01:00:01.000Z",
+          "chat",
+          "legacy response"
+        );
+      outbound.close();
+
+      const messages = readNanoclawV2SessionMessages({
+        inboundDbPath: inboundPath,
+        outboundDbPath: outboundPath,
+      });
+      expect(messages.map((m) => [m.row.id, m.message.content])).toEqual([
+        ["legacy-in", "legacy hello"],
+        ["legacy-out", "legacy response"],
+      ]);
+      expect(messages[0].message.details).toMatchObject({
+        trigger: null,
+        sourceSessionId: null,
+      });
+      expect(messages[1].message.details).toMatchObject({ inReplyTo: null });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -143,7 +368,11 @@ describe("nanoclaw v2 bridge", () => {
       name: "lcm_fake",
       description: "fake tool",
       parameters: { type: "object", properties: { query: { type: "string" } } },
-      async execute(toolCallId: string, params: Record<string, unknown>, context?: unknown) {
+      async execute(
+        toolCallId: string,
+        params: Record<string, unknown>,
+        context?: unknown
+      ) {
         calls.push({ toolCallId, params, context });
         return { content: [{ type: "text", text: "ok" }] };
       },

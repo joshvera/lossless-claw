@@ -1,7 +1,7 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentMessage } from "./openclaw-bridge.js";
+import type { AgentMessage, BootstrapResult } from "./openclaw-bridge.js";
 import type { LcmContextEngine } from "./engine.js";
 import type { LcmDependencies } from "./types.js";
 import type { AnyAgentTool } from "./tools/common.js";
@@ -65,6 +65,25 @@ export type NanoclawV2TranscriptMessage = {
   message: AgentMessage;
 };
 
+export type NanoclawV2TranscriptWriteResult = {
+  sessionFile: string;
+  sessionKey: string;
+  messageCount: number;
+};
+
+export type NanoclawV2BootstrapResult = NanoclawV2TranscriptWriteResult & {
+  session: NanoclawV2Session;
+  bootstrap: BootstrapResult;
+};
+
+export type NanoclawV2BootstrapEngine = {
+  bootstrap(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<BootstrapResult>;
+};
+
 export type NanoclawV2McpTool = {
   name: string;
   description?: string;
@@ -90,18 +109,22 @@ export type CreateNanoclawV2RecallToolsInput = {
   sessionKey?: string;
 };
 
-export function resolveNanoclawV2Paths(input: {
-  projectRoot?: string;
-  dataDir?: string;
-  env?: NodeJS.ProcessEnv;
-} = {}): NanoclawV2Paths {
+export function resolveNanoclawV2Paths(
+  input: {
+    projectRoot?: string;
+    dataDir?: string;
+    env?: NodeJS.ProcessEnv;
+  } = {}
+): NanoclawV2Paths {
   const env = input.env ?? process.env;
-  const projectRoot = resolve(input.projectRoot ?? env.NANOCLAW_PROJECT_ROOT ?? process.cwd());
+  const projectRoot = resolve(
+    input.projectRoot ?? env.NANOCLAW_PROJECT_ROOT ?? process.cwd()
+  );
   const dataDir = resolve(
-    input.dataDir
-      ?? env.NANOCLAW_DATA_DIR
-      ?? env.NANOCLAW_STATE_DIR
-      ?? join(projectRoot, "data"),
+    input.dataDir ??
+      env.NANOCLAW_DATA_DIR ??
+      env.NANOCLAW_STATE_DIR ??
+      join(projectRoot, "data")
   );
   return {
     projectRoot,
@@ -111,36 +134,53 @@ export function resolveNanoclawV2Paths(input: {
   };
 }
 
-export function resolveNanoclawV2LcmStateDir(input: {
-  projectRoot?: string;
-  dataDir?: string;
-  env?: NodeJS.ProcessEnv;
-} = {}): string {
+export function resolveNanoclawV2LcmStateDir(
+  input: {
+    projectRoot?: string;
+    dataDir?: string;
+    env?: NodeJS.ProcessEnv;
+  } = {}
+): string {
   const env = input.env ?? process.env;
   return resolve(
-    env.LCM_NANOCLAW_STATE_DIR
-      ?? env.LCM_STATE_DIR
-      ?? join(resolveNanoclawV2Paths(input).dataDir, "lossless-claw"),
+    env.LCM_NANOCLAW_STATE_DIR ??
+      env.LCM_STATE_DIR ??
+      join(resolveNanoclawV2Paths(input).dataDir, "lossless-claw")
   );
 }
 
-export function nanoclawV2SessionDir(paths: NanoclawV2Paths, session: Pick<NanoclawV2Session, "agent_group_id" | "id">): string {
+export function nanoclawV2SessionDir(
+  paths: NanoclawV2Paths,
+  session: Pick<NanoclawV2Session, "agent_group_id" | "id">
+): string {
   return join(paths.sessionsDir, session.agent_group_id, session.id);
 }
 
-export function nanoclawV2InboundDbPath(paths: NanoclawV2Paths, session: Pick<NanoclawV2Session, "agent_group_id" | "id">): string {
+export function nanoclawV2InboundDbPath(
+  paths: NanoclawV2Paths,
+  session: Pick<NanoclawV2Session, "agent_group_id" | "id">
+): string {
   return join(nanoclawV2SessionDir(paths, session), "inbound.db");
 }
 
-export function nanoclawV2OutboundDbPath(paths: NanoclawV2Paths, session: Pick<NanoclawV2Session, "agent_group_id" | "id">): string {
+export function nanoclawV2OutboundDbPath(
+  paths: NanoclawV2Paths,
+  session: Pick<NanoclawV2Session, "agent_group_id" | "id">
+): string {
   return join(nanoclawV2SessionDir(paths, session), "outbound.db");
 }
 
-export function buildNanoclawV2SessionKey(session: Pick<NanoclawV2Session, "agent_group_id" | "id">): string {
-  return `nanoclaw:v2:${encodeURIComponent(session.agent_group_id)}:${encodeURIComponent(session.id)}`;
+export function buildNanoclawV2SessionKey(
+  session: Pick<NanoclawV2Session, "agent_group_id" | "id">
+): string {
+  return `nanoclaw:v2:${encodeURIComponent(
+    session.agent_group_id
+  )}:${encodeURIComponent(session.id)}`;
 }
 
-export function parseNanoclawV2SessionKey(sessionKey: string): Pick<NanoclawV2Session, "agent_group_id" | "id"> | null {
+export function parseNanoclawV2SessionKey(
+  sessionKey: string
+): Pick<NanoclawV2Session, "agent_group_id" | "id"> | null {
   const parts = sessionKey.split(":");
   if (parts.length !== 4 || parts[0] !== "nanoclaw" || parts[1] !== "v2") {
     return null;
@@ -153,11 +193,108 @@ export function parseNanoclawV2SessionKey(sessionKey: string): Pick<NanoclawV2Se
   return { agent_group_id: agentGroupId, id: sessionId };
 }
 
-export function isNanoclawV2SessionKey(sessionKey: string | undefined): boolean {
-  return typeof sessionKey === "string" && parseNanoclawV2SessionKey(sessionKey) !== null;
+export function isNanoclawV2SessionKey(
+  sessionKey: string | undefined
+): boolean {
+  return (
+    typeof sessionKey === "string" &&
+    parseNanoclawV2SessionKey(sessionKey) !== null
+  );
 }
 
-export function readNanoclawV2Sessions(centralDbPath: string): NanoclawV2Session[] {
+export function nanoclawV2TranscriptFilePath(
+  paths: Pick<NanoclawV2Paths, "dataDir">,
+  session: Pick<NanoclawV2Session, "agent_group_id" | "id">,
+  input: { lcmStateDir?: string; env?: NodeJS.ProcessEnv } = {}
+): string {
+  const stateDir = resolveNanoclawV2LcmStateDir({
+    dataDir: paths.dataDir,
+    env: input.env,
+  });
+  return join(
+    input.lcmStateDir ?? stateDir,
+    "nanoclaw-v2-transcripts",
+    encodePathSegment(session.agent_group_id),
+    `${encodePathSegment(session.id)}.jsonl`
+  );
+}
+
+export function writeNanoclawV2SessionTranscriptFile(input: {
+  paths: NanoclawV2Paths;
+  session: NanoclawV2Session;
+  sessionFile?: string;
+  lcmStateDir?: string;
+  includeSystem?: boolean;
+}): NanoclawV2TranscriptWriteResult {
+  const sessionKey = buildNanoclawV2SessionKey(input.session);
+  const sessionFile =
+    input.sessionFile ??
+    nanoclawV2TranscriptFilePath(input.paths, input.session, {
+      lcmStateDir: input.lcmStateDir,
+    });
+  const transcript = readNanoclawV2SessionMessages({
+    inboundDbPath: nanoclawV2InboundDbPath(input.paths, input.session),
+    outboundDbPath: nanoclawV2OutboundDbPath(input.paths, input.session),
+    includeSystem: input.includeSystem,
+  });
+  mkdirSync(dirname(sessionFile), { recursive: true });
+  const transcriptJsonl = transcript
+    .map((entry) => JSON.stringify({ message: entry.message }))
+    .join("\n");
+  writeFileSync(
+    sessionFile,
+    transcriptJsonl + (transcriptJsonl ? "\n" : ""),
+    "utf8"
+  );
+  return { sessionFile, sessionKey, messageCount: transcript.length };
+}
+
+export async function bootstrapNanoclawV2Session(input: {
+  lcm: NanoclawV2BootstrapEngine;
+  paths: NanoclawV2Paths;
+  session: NanoclawV2Session;
+  sessionFile?: string;
+  lcmStateDir?: string;
+  includeSystem?: boolean;
+}): Promise<NanoclawV2BootstrapResult> {
+  const written = writeNanoclawV2SessionTranscriptFile(input);
+  const bootstrap = await input.lcm.bootstrap({
+    sessionId: input.session.id,
+    sessionKey: written.sessionKey,
+    sessionFile: written.sessionFile,
+  });
+  return { ...written, session: input.session, bootstrap };
+}
+
+export async function bootstrapNanoclawV2Sessions(input: {
+  lcm: NanoclawV2BootstrapEngine;
+  paths: NanoclawV2Paths;
+  sessions?: NanoclawV2Session[];
+  filter?: (session: NanoclawV2Session) => boolean;
+  lcmStateDir?: string;
+  includeSystem?: boolean;
+}): Promise<NanoclawV2BootstrapResult[]> {
+  const sessions =
+    input.sessions ?? readNanoclawV2Sessions(input.paths.centralDbPath);
+  const selected = input.filter ? sessions.filter(input.filter) : sessions;
+  const results: NanoclawV2BootstrapResult[] = [];
+  for (const session of selected) {
+    results.push(
+      await bootstrapNanoclawV2Session({
+        lcm: input.lcm,
+        paths: input.paths,
+        session,
+        lcmStateDir: input.lcmStateDir,
+        includeSystem: input.includeSystem,
+      })
+    );
+  }
+  return results;
+}
+
+export function readNanoclawV2Sessions(
+  centralDbPath: string
+): NanoclawV2Session[] {
   if (!existsSync(centralDbPath)) {
     return [];
   }
@@ -166,11 +303,13 @@ export function readNanoclawV2Sessions(centralDbPath: string): NanoclawV2Session
     if (!hasTable(db, "sessions")) {
       return [];
     }
-    return db.prepare(
-      `SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at
+    return db
+      .prepare(
+        `SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at
          FROM sessions
-        ORDER BY COALESCE(last_active, created_at, '') DESC, id ASC`,
-    ).all() as NanoclawV2Session[];
+        ORDER BY COALESCE(last_active, created_at, '') DESC, id ASC`
+      )
+      .all() as NanoclawV2Session[];
   } finally {
     db.close();
   }
@@ -199,7 +338,9 @@ export function readNanoclawV2SessionMessages(input: {
   return [...inbound, ...outbound].sort(compareTranscriptMessages);
 }
 
-export function mapNanoclawV2InboundToAgentMessage(row: NanoclawV2MessageInRow): AgentMessage {
+export function mapNanoclawV2InboundToAgentMessage(
+  row: NanoclawV2MessageInRow
+): AgentMessage {
   const parsed = parseJsonMaybe(row.content);
   return {
     role: inboundRole(row.kind),
@@ -222,7 +363,9 @@ export function mapNanoclawV2InboundToAgentMessage(row: NanoclawV2MessageInRow):
   };
 }
 
-export function mapNanoclawV2OutboundToAgentMessage(row: NanoclawV2MessageOutRow): AgentMessage {
+export function mapNanoclawV2OutboundToAgentMessage(
+  row: NanoclawV2MessageOutRow
+): AgentMessage {
   const parsed = parseJsonMaybe(row.content);
   return {
     role: outboundRole(row.kind),
@@ -251,11 +394,21 @@ export function normalizeNanoclawV2Content(value: unknown): string {
     return "";
   }
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeNanoclawV2Content(item)).filter(Boolean).join("\n");
+    return value
+      .map((item) => normalizeNanoclawV2Content(item))
+      .filter(Boolean)
+      .join("\n");
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
-    for (const key of ["text", "markdown", "message", "prompt", "title", "fallbackText"] as const) {
+    for (const key of [
+      "text",
+      "markdown",
+      "message",
+      "prompt",
+      "title",
+      "fallbackText",
+    ] as const) {
       const field = record[key];
       if (typeof field === "string" && field.trim()) {
         return field;
@@ -269,7 +422,10 @@ export function normalizeNanoclawV2Content(value: unknown): string {
   return String(value);
 }
 
-export function adaptLcmToolForNanoclawV2(tool: AnyAgentTool, context: NanoclawV2ToolAdapterContext = {}): NanoclawV2McpToolDefinition {
+export function adaptLcmToolForNanoclawV2(
+  tool: AnyAgentTool,
+  context: NanoclawV2ToolAdapterContext = {}
+): NanoclawV2McpToolDefinition {
   const inputSchema = toolSchema(tool);
   return {
     tool: {
@@ -278,11 +434,13 @@ export function adaptLcmToolForNanoclawV2(tool: AnyAgentTool, context: NanoclawV
       inputSchema,
     },
     async handler(args) {
-      const toolCallId = `${context.toolCallIdPrefix ?? "nanoclaw-v2"}-${tool.name}-${Date.now()}`;
+      const toolCallId = `${context.toolCallIdPrefix ?? "nanoclaw-v2"}-${
+        tool.name
+      }-${Date.now()}`;
       const execute = tool.execute as unknown as (
         toolCallId: string,
         params: Record<string, unknown>,
-        context?: { sessionId?: string; sessionKey?: string },
+        context?: { sessionId?: string; sessionKey?: string }
       ) => Promise<unknown>;
       return execute(toolCallId, args ?? {}, {
         sessionId: context.sessionId,
@@ -292,7 +450,9 @@ export function adaptLcmToolForNanoclawV2(tool: AnyAgentTool, context: NanoclawV
   };
 }
 
-export function createNanoclawV2RecallTools(input: CreateNanoclawV2RecallToolsInput): NanoclawV2McpToolDefinition[] {
+export function createNanoclawV2RecallTools(
+  input: CreateNanoclawV2RecallToolsInput
+): NanoclawV2McpToolDefinition[] {
   const shared = {
     deps: input.deps,
     lcm: input.lcm,
@@ -326,12 +486,34 @@ function readInboundRows(dbPath: string): NanoclawV2MessageInRow[] {
     if (!hasTable(db, "messages_in")) {
       return [];
     }
-    return db.prepare(
-      `SELECT id, seq, kind, timestamp, status, process_after, recurrence, tries, trigger,
-              platform_id, channel_type, thread_id, content, source_session_id, on_wake
+    const columns = getTableColumns(db, "messages_in");
+    const seqOrder = columns.has("seq")
+      ? "COALESCE(seq, 0)"
+      : "CAST(0 AS INTEGER)";
+    const select = selectColumns(columns, [
+      "id",
+      "seq",
+      "kind",
+      "timestamp",
+      "status",
+      "process_after",
+      "recurrence",
+      "tries",
+      "trigger",
+      "platform_id",
+      "channel_type",
+      "thread_id",
+      "content",
+      "source_session_id",
+      "on_wake",
+    ]);
+    return db
+      .prepare(
+        `SELECT ${select}
          FROM messages_in
-        ORDER BY timestamp ASC, COALESCE(seq, 0) ASC, id ASC`,
-    ).all() as NanoclawV2MessageInRow[];
+        ORDER BY timestamp ASC, ${seqOrder} ASC, id ASC`
+      )
+      .all() as NanoclawV2MessageInRow[];
   } finally {
     db.close();
   }
@@ -346,12 +528,30 @@ function readOutboundRows(dbPath: string): NanoclawV2MessageOutRow[] {
     if (!hasTable(db, "messages_out")) {
       return [];
     }
-    return db.prepare(
-      `SELECT id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind,
-              platform_id, channel_type, thread_id, content
+    const columns = getTableColumns(db, "messages_out");
+    const seqOrder = columns.has("seq")
+      ? "COALESCE(seq, 0)"
+      : "CAST(0 AS INTEGER)";
+    const select = selectColumns(columns, [
+      "id",
+      "seq",
+      "in_reply_to",
+      "timestamp",
+      "deliver_after",
+      "recurrence",
+      "kind",
+      "platform_id",
+      "channel_type",
+      "thread_id",
+      "content",
+    ]);
+    return db
+      .prepare(
+        `SELECT ${select}
          FROM messages_out
-        ORDER BY timestamp ASC, COALESCE(seq, 0) ASC, id ASC`,
-    ).all() as NanoclawV2MessageOutRow[];
+        ORDER BY timestamp ASC, ${seqOrder} ASC, id ASC`
+      )
+      .all() as NanoclawV2MessageOutRow[];
   } finally {
     db.close();
   }
@@ -362,8 +562,31 @@ function openReadOnlyDatabase(dbPath: string): DatabaseSync {
 }
 
 function hasTable(db: DatabaseSync, tableName: string): boolean {
-  const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(tableName);
+  const row = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
+    )
+    .get(tableName);
   return row !== undefined;
+}
+
+function selectColumns(
+  columns: Set<string>,
+  expectedColumns: string[]
+): string {
+  return expectedColumns
+    .map((column) => (columns.has(column) ? column : `NULL AS ${column}`))
+    .join(", ");
+}
+
+function getTableColumns(db: DatabaseSync, tableName: string): Set<string> {
+  return new Set(
+    (
+      db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name)
+  );
 }
 
 function parseJsonMaybe(value: string): unknown {
@@ -393,7 +616,10 @@ function outboundRole(kind: string): string {
   return "assistant";
 }
 
-function compareTranscriptMessages(left: NanoclawV2TranscriptMessage, right: NanoclawV2TranscriptMessage): number {
+function compareTranscriptMessages(
+  left: NanoclawV2TranscriptMessage,
+  right: NanoclawV2TranscriptMessage
+): number {
   const leftTime = timestampMillis(left.row.timestamp) ?? 0;
   const rightTime = timestampMillis(right.row.timestamp) ?? 0;
   if (leftTime !== rightTime) {
@@ -410,6 +636,10 @@ function compareTranscriptMessages(left: NanoclawV2TranscriptMessage, right: Nan
   return left.row.id.localeCompare(right.row.id);
 }
 
+function encodePathSegment(value: string): string {
+  return encodeURIComponent(value).replace(/%/g, "_");
+}
+
 function safeDecodeURIComponent(value: string): string {
   try {
     return decodeURIComponent(value);
@@ -419,7 +649,10 @@ function safeDecodeURIComponent(value: string): string {
 }
 
 function toolSchema(tool: AnyAgentTool): Record<string, unknown> | undefined {
-  const candidate = (tool as unknown as { parameters?: unknown; inputSchema?: unknown }).parameters
-    ?? (tool as unknown as { inputSchema?: unknown }).inputSchema;
-  return candidate && typeof candidate === "object" ? candidate as Record<string, unknown> : undefined;
+  const candidate =
+    (tool as unknown as { parameters?: unknown; inputSchema?: unknown })
+      .parameters ?? (tool as unknown as { inputSchema?: unknown }).inputSchema;
+  return candidate && typeof candidate === "object"
+    ? (candidate as Record<string, unknown>)
+    : undefined;
 }
