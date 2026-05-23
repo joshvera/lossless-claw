@@ -292,6 +292,39 @@ describe("nanoclaw v2 bridge", () => {
         ["assistant", "second"],
       ]);
 
+      const nextInbound = new DatabaseSync(inboundPath);
+      nextInbound
+        .prepare(
+          "INSERT INTO messages_in (id, seq, kind, timestamp, content) VALUES (?, ?, ?, ?, ?)"
+        )
+        .run(
+          "in-2",
+          5,
+          "chat",
+          "2026-05-23T01:00:02.000Z",
+          JSON.stringify({ text: "third" })
+        );
+      nextInbound.close();
+
+      const rewritten = writeNanoclawV2SessionTranscriptFile({
+        paths,
+        session,
+        lcmStateDir,
+      });
+      expect(rewritten).toMatchObject({
+        sessionFile: defaultPath,
+        messageCount: 3,
+      });
+      const rewrittenLines = readFileSync(rewritten.sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(rewrittenLines.map((line) => line.message.content)).toEqual([
+        "first",
+        "second",
+        "third",
+      ]);
+
       const calls: unknown[] = [];
       const lcm = {
         async bootstrap(params: {
@@ -335,7 +368,7 @@ describe("nanoclaw v2 bridge", () => {
     }
   });
 
-  it("degrades recoverable SQLite read failures without overwriting an existing transcript mirror", () => {
+  it("degrades recoverable SQLite read failures only when callers observe them", async () => {
     const root = join(
       tmpdir(),
       `lcm-nanoclaw-v2-read-failure-${process.pid}-${Date.now()}`
@@ -358,6 +391,19 @@ describe("nanoclaw v2 bridge", () => {
         source: "sessions",
         dbPath: paths.centralDbPath,
       });
+      expect(() => readNanoclawV2Sessions(paths.centralDbPath)).toThrow(
+        /database/
+      );
+      await expect(
+        bootstrapNanoclawV2Sessions({
+          lcm: {
+            async bootstrap() {
+              return { bootstrapped: true, importedMessages: 0 };
+            },
+          },
+          paths,
+        })
+      ).rejects.toThrow(/database/);
 
       const inboundPath = nanoclawV2InboundDbPath(paths, session);
       writeFileSync(inboundPath, "not a sqlite database", "utf8");

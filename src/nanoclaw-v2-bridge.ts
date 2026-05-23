@@ -648,7 +648,7 @@ function writeTranscriptJsonlAtomically(
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    renameSync(tempFile, sessionFile);
+    renameAtomicallyWithOverwriteFallback(tempFile, sessionFile);
     fsyncDirectoryBestEffort(sessionDir);
   } catch (error) {
     if (fd !== undefined) {
@@ -665,6 +665,28 @@ function writeTranscriptJsonlAtomically(
     }
     throw error;
   }
+}
+
+function renameAtomicallyWithOverwriteFallback(
+  tempFile: string,
+  destinationFile: string
+): void {
+  try {
+    renameSync(tempFile, destinationFile);
+    return;
+  } catch (error) {
+    if (!isRenameDestinationExistsError(error)) {
+      throw error;
+    }
+  }
+
+  unlinkSync(destinationFile);
+  renameSync(tempFile, destinationFile);
+}
+
+function isRenameDestinationExistsError(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code;
+  return code === "EEXIST" || code === "EPERM" || code === "ENOTEMPTY";
 }
 
 function fsyncDirectoryBestEffort(directory: string): void {
@@ -687,10 +709,10 @@ function handleSqliteReadError<T>(input: {
   error: unknown;
   onReadError?: NanoclawV2ReadErrorHandler;
 }): T[] {
-  if (!isRecoverableSqliteReadError(input.error)) {
+  if (!isRecoverableSqliteReadError(input.error) || !input.onReadError) {
     throw input.error;
   }
-  input.onReadError?.({
+  input.onReadError({
     source: input.source,
     dbPath: input.dbPath,
     error: input.error,
