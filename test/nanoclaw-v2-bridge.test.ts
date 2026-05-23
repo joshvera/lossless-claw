@@ -1,4 +1,10 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -13,9 +19,11 @@ import {
   mapNanoclawV2OutboundToAgentMessage,
   nanoclawV2InboundDbPath,
   nanoclawV2OutboundDbPath,
+  nanoclawV2SessionDir,
   nanoclawV2TranscriptFilePath,
   parseNanoclawV2SessionKey,
   readNanoclawV2SessionMessages,
+  readNanoclawV2Sessions,
   writeNanoclawV2SessionTranscriptFile,
   resolveNanoclawV2Paths,
 } from "../src/nanoclaw-v2-bridge.js";
@@ -41,13 +49,42 @@ describe("nanoclaw v2 bridge", () => {
     );
   });
 
+  it("rejects NanoClaw session paths that escape the sessions root", () => {
+    const paths = resolveNanoclawV2Paths({ projectRoot: "/repo/nanoclaw" });
+
+    expect(
+      nanoclawV2SessionDir(paths, { agent_group_id: "ag", id: "sess" })
+    ).toBe("/repo/nanoclaw/data/v2-sessions/ag/sess");
+    expect(
+      nanoclawV2SessionDir(paths, { agent_group_id: "..ag", id: "sess" })
+    ).toBe("/repo/nanoclaw/data/v2-sessions/..ag/sess");
+    expect(() =>
+      nanoclawV2InboundDbPath(paths, {
+        agent_group_id: "..",
+        id: "outside",
+      })
+    ).toThrow(/escapes sessionsDir/);
+    expect(() =>
+      nanoclawV2OutboundDbPath(paths, {
+        agent_group_id: "ag",
+        id: "../../outside",
+      })
+    ).toThrow(/escapes sessionsDir/);
+    expect(() =>
+      nanoclawV2InboundDbPath(paths, {
+        agent_group_id: "/tmp",
+        id: "outside",
+      })
+    ).toThrow(/escapes sessionsDir/);
+  });
+
   it("maps inbound and outbound rows into LCM agent messages without dropping raw metadata", () => {
     const inbound = mapNanoclawV2InboundToAgentMessage({
       id: "in-1",
       seq: 2,
       kind: "chat-sdk",
       timestamp: "2026-05-23T01:00:00.000Z",
-      content: JSON.stringify({ text: "hello", sender: "Vera" }),
+      content: JSON.stringify({ text: "hello", sender: "Test User" }),
       platform_id: "platform-1",
       channel_type: "cli",
       thread_id: "thread-1",
@@ -298,6 +335,68 @@ describe("nanoclaw v2 bridge", () => {
     }
   });
 
+  it("degrades recoverable SQLite read failures without overwriting an existing transcript mirror", () => {
+    const root = join(
+      tmpdir(),
+      `lcm-nanoclaw-v2-read-failure-${process.pid}-${Date.now()}`
+    );
+    mkdirSync(root, { recursive: true });
+    try {
+      const paths = resolveNanoclawV2Paths({ projectRoot: root });
+      const session = { agent_group_id: "ag", id: "sess" };
+      mkdirSync(nanoclawV2SessionDir(paths, session), { recursive: true });
+
+      const centralFailures: unknown[] = [];
+      writeFileSync(paths.centralDbPath, "not a sqlite database", "utf8");
+      expect(
+        readNanoclawV2Sessions(paths.centralDbPath, {
+          onReadError: (failure) => centralFailures.push(failure),
+        })
+      ).toEqual([]);
+      expect(centralFailures).toHaveLength(1);
+      expect(centralFailures[0]).toMatchObject({
+        source: "sessions",
+        dbPath: paths.centralDbPath,
+      });
+
+      const inboundPath = nanoclawV2InboundDbPath(paths, session);
+      writeFileSync(inboundPath, "not a sqlite database", "utf8");
+      const messageFailures: unknown[] = [];
+      expect(
+        readNanoclawV2SessionMessages({
+          inboundDbPath: inboundPath,
+          outboundDbPath: nanoclawV2OutboundDbPath(paths, session),
+          onReadError: (failure) => messageFailures.push(failure),
+        })
+      ).toEqual([]);
+      expect(messageFailures).toHaveLength(1);
+      expect(messageFailures[0]).toMatchObject({
+        source: "inbound",
+        dbPath: inboundPath,
+      });
+
+      const sessionFile = join(root, "mirror.jsonl");
+      const previousMirror = `${JSON.stringify({
+        message: { role: "user", content: "previous" },
+      })}\n`;
+      writeFileSync(sessionFile, previousMirror, "utf8");
+
+      expect(() =>
+        writeNanoclawV2SessionTranscriptFile({
+          paths,
+          session,
+          sessionFile,
+        })
+      ).toThrow(/Refusing to overwrite/);
+      expect(readFileSync(sessionFile, "utf8")).toBe(previousMirror);
+      expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual(
+        []
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("tolerates legacy NanoClaw session DBs without later optional columns", () => {
     const root = join(
       tmpdir(),
@@ -390,10 +489,21 @@ describe("nanoclaw v2 bridge", () => {
       inputSchema: { type: "object" },
     });
     await adapted.handler({ query: "flamingo" });
-    expect(calls).toHaveLength(1);
+    await adapted.handler({ query: "heron" });
+    expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
       params: { query: "flamingo" },
       context: { sessionId: "sess-1", sessionKey: "nanoclaw:v2:ag:sess-1" },
     });
+    expect(calls[1]).toMatchObject({
+      params: { query: "heron" },
+      context: { sessionId: "sess-1", sessionKey: "nanoclaw:v2:ag:sess-1" },
+    });
+    const ids = calls.map(
+      (call) => (call as { toolCallId: string }).toolCallId
+    );
+    expect(ids[0]).toMatch(/^test-lcm_fake-/);
+    expect(ids[1]).toMatch(/^test-lcm_fake-/);
+    expect(ids[0]).not.toBe(ids[1]);
   });
 });

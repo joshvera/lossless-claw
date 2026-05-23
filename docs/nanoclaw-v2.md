@@ -4,7 +4,7 @@
 
 ## Target interface
 
-The bridge matches the NanoClaw v2 layout observed in `/Users/vera/github/finn` after the v2 update:
+The bridge matches the documented NanoClaw v2 layout for a project root such as `/path/to/nanoclaw-project`:
 
 - central app DB: `data/v2.db`
 - session folders: `data/v2-sessions/<agent_group_id>/<session_id>/`
@@ -60,7 +60,9 @@ const results = await bootstrapNanoclawV2Sessions({
   includeSystem: false,
 });
 
-console.log(`Bootstrapped ${results.length} NanoClaw sessions into lossless-claw`);
+console.log(
+  `Bootstrapped ${results.length} NanoClaw sessions into lossless-claw`
+);
 ```
 
 For a single active session, use the narrower helper:
